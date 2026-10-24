@@ -6,7 +6,7 @@ dist/
 wheels/
 *.egg-info
 uv.lock
-
+.mypy_cache/
 
 # Virtual environments
 .venv
@@ -15,6 +15,13 @@ uv.lock
 # Data files
 code_trials
 .vscode
-
+output/
+runs/
+tests/
+data/
+models/
 # Database files
 *.db
+
+# Per-analysis processed uploads and outputs
+analysis_results/
