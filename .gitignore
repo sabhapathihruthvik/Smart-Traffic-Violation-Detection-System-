@@ -18,7 +18,8 @@ code_trials
 output/
 runs/
 tests/
-models/
+models/yolo26m_face_lp.pt
+
 # Database files
 *.db
 
