@@ -16,9 +16,19 @@ the database.
 
 Wrong-direction detection uses persistent vehicle tracks and a manually
 configured lane polygon, not a separate detector. Choose the permitted lane
-direction and edit the polygon's four normalized frame points in the UI.
-Thresholds, trajectory history, default lane geometry, and debug overlays are
-configurable in `inference_config.py`.
+direction and edit the polygon's normalized frame points in the UI, then save
+the settings for that source.
+
+Red-light detection is an optional operation that reuses vehicle tracking.
+Select it for a video, draw the traffic-light ROI and stop line over the source
+preview, choose the crossing direction, and save the setup. The normalized
+coordinates and wrong-direction settings are read from and saved to
+`data/sample_data/metadata.jsonl`, which also provides defaults for sources
+without saved settings. Operation tags in that file are suggestions only;
+every operation can be selected for any supported image or video. The result
+overlays the detected signal state and marks confirmed red-light crossings.
+During analysis, the UI displays the current processing phase, frame-based
+progress, and an estimated remaining time when the video reports a frame count.
 
 Place the trained weights in the root `models/` folder using these filenames:
 

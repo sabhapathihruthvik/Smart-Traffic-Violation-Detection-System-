@@ -6,7 +6,7 @@ from functools import lru_cache
 import math
 from pathlib import Path
 from threading import Lock
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 import shutil
 import uuid
 
@@ -30,6 +30,294 @@ _DIRECTION_VECTORS = {
     "LEFT_TO_RIGHT": (1.0, 0.0),
     "RIGHT_TO_LEFT": (-1.0, 0.0),
 }
+_RED_LIGHT_CROSSING_DIRECTIONS = {
+    "NEGATIVE_TO_POSITIVE",
+    "POSITIVE_TO_NEGATIVE",
+}
+
+
+def resolve_red_light_config(
+    light_roi: Iterable[float],
+    stop_line: Iterable[Iterable[float]],
+    crossing_direction: str = "NEGATIVE_TO_POSITIVE",
+) -> tuple[tuple[float, float, float, float], tuple[tuple[float, float], ...], str]:
+    try:
+        x1, y1, x2, y2 = (float(value) for value in light_roi)
+        points = tuple(
+            (float(point[0]), float(point[1]))
+            for point in stop_line
+        )
+    except (TypeError, ValueError, IndexError) as error:
+        raise ValueError(
+            "Traffic-light ROI and stop line must contain normalized coordinates."
+        ) from error
+
+    if (
+        len(points) != 2
+        or any(
+            not math.isfinite(value) or value < 0 or value > 1
+            for value in (x1, y1, x2, y2, *[c for point in points for c in point])
+        )
+        or x2 <= x1
+        or y2 <= y1
+    ):
+        raise ValueError(
+            "Traffic-light ROI must be a non-empty normalized rectangle and "
+            "stop line must have two normalized endpoints."
+        )
+    if math.dist(points[0], points[1]) < 1e-5:
+        raise ValueError("Stop line endpoints must be different.")
+    direction = crossing_direction.strip().upper()
+    if direction not in _RED_LIGHT_CROSSING_DIRECTIONS:
+        raise ValueError(
+            "Crossing direction must be NEGATIVE_TO_POSITIVE or "
+            "POSITIVE_TO_NEGATIVE."
+        )
+    return (x1, y1, x2, y2), points, direction
+
+
+class RedLightViolationDetector:
+    def __init__(
+        self,
+        light_roi: Iterable[float],
+        stop_line: Iterable[Iterable[float]],
+        crossing_direction: str = "NEGATIVE_TO_POSITIVE",
+        fps: float = 30.0,
+    ) -> None:
+        (
+            self.light_roi,
+            self.stop_line,
+            self.crossing_direction,
+        ) = resolve_red_light_config(light_roi, stop_line, crossing_direction)
+        self.fps = max(float(fps), 1.0)
+        self.signal_history: deque[str] = deque(
+            maxlen=config.RED_LIGHT_STATE_HISTORY
+        )
+        self.signal_state = "UNKNOWN"
+        self.track_states: dict[str, dict[str, Any]] = {}
+        self.events: list[dict[str, Any]] = []
+
+    def reset(self) -> None:
+        self.signal_history.clear()
+        self.signal_state = "UNKNOWN"
+        self.track_states.clear()
+        self.events.clear()
+
+    def _signal_observation(self, frame: Any) -> str:
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = self.light_roi
+        left = max(0, min(width - 1, int(x1 * width)))
+        top = max(0, min(height - 1, int(y1 * height)))
+        right = max(left + 1, min(width, int(math.ceil(x2 * width))))
+        bottom = max(top + 1, min(height, int(math.ceil(y2 * height))))
+        roi = frame[top:bottom, left:right]
+        if roi.size == 0:
+            return "UNKNOWN"
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        illuminated = (saturation >= 100) & (value >= 160)
+        masks = {
+            "RED": ((hue <= 10) | (hue >= 170)) & illuminated,
+            "YELLOW": (hue >= 15) & (hue <= 40) & illuminated,
+            "GREEN": (hue >= 40) & (hue <= 90) & illuminated,
+        }
+        counts = {
+            color: int(np.count_nonzero(mask))
+            for color, mask in masks.items()
+        }
+        threshold = max(
+            config.RED_LIGHT_MIN_ACTIVE_PIXELS,
+            int(roi.shape[0] * roi.shape[1] * config.RED_LIGHT_MIN_ACTIVE_ROI_RATIO),
+        )
+        winner, strongest = max(counts.items(), key=lambda item: item[1])
+        runner_up = max(
+            (count for color, count in counts.items() if color != winner),
+            default=0,
+        )
+        if strongest < threshold or (
+            runner_up
+            and strongest < runner_up * config.RED_LIGHT_COLOR_DOMINANCE_RATIO
+        ):
+            return "UNKNOWN"
+        return winner
+
+    def _smooth_signal(self, observation: str) -> str:
+        self.signal_history.append(observation)
+        counts = {
+            state: self.signal_history.count(state)
+            for state in ("RED", "YELLOW", "GREEN")
+        }
+        winner = max(counts, key=counts.get)
+        ordered = sorted(counts.values(), reverse=True)
+        if (
+            counts[winner] < config.RED_LIGHT_STATE_CONFIRMATION_FRAMES
+            or len(ordered) > 1
+            and ordered[0] == ordered[1]
+            or self.signal_history[-1] != winner
+        ):
+            return "UNKNOWN"
+        return winner
+
+    def update(
+        self,
+        frame: Any,
+        tracks: list[dict[str, Any]],
+        frame_index: int,
+    ) -> dict[str, Any]:
+        raw_signal = self._signal_observation(frame)
+        self.signal_state = self._smooth_signal(raw_signal)
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = self.light_roi
+        roi_box = (
+            round(x1 * width),
+            round(y1 * height),
+            round(x2 * width),
+            round(y2 * height),
+        )
+        cv2.rectangle(
+            frame,
+            roi_box[:2],
+            roi_box[2:],
+            config.RED_LIGHT_COLORS[self.signal_state],
+            2,
+        )
+        cv2.putText(
+            frame,
+            f"Signal: {self.signal_state} (raw {raw_signal})",
+            (roi_box[0], max(18, roi_box[1] - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            config.RED_LIGHT_COLORS[self.signal_state],
+            2,
+            cv2.LINE_AA,
+        )
+
+        (start_x, start_y), (end_x, end_y) = self.stop_line
+        line_start = (round(start_x * width), round(start_y * height))
+        line_end = (round(end_x * width), round(end_y * height))
+        cv2.line(frame, line_start, line_end, (255, 220, 0), 3, cv2.LINE_AA)
+        direction_sign = (
+            1 if self.crossing_direction == "NEGATIVE_TO_POSITIVE" else -1
+        )
+        midpoint = (
+            (line_start[0] + line_end[0]) // 2,
+            (line_start[1] + line_end[1]) // 2,
+        )
+        dx = line_end[0] - line_start[0]
+        dy = line_end[1] - line_start[1]
+        line_length = max(math.hypot(dx, dy), 1)
+        arrow_end = (
+            round(midpoint[0] + direction_sign * dy / line_length * 30),
+            round(midpoint[1] - direction_sign * dx / line_length * 30),
+        )
+        cv2.arrowedLine(
+            frame, midpoint, arrow_end, (255, 220, 0), 2, tipLength=0.3
+        )
+
+        deadband = min(height, width) * config.RED_LIGHT_CROSSING_DEADBAND_RATIO
+        max_gap_frames = round(
+            self.fps * config.RED_LIGHT_MAX_CROSSING_GAP_SECONDS
+        )
+        current_states = {}
+        for record in tracks:
+            vehicle_id = record["id"]
+            box_x1, _, box_x2, box_y2 = record["box"]
+            point = ((box_x1 + box_x2) / 2, box_y2)
+            signed_distance = (
+                dx * (point[1] - line_start[1])
+                - dy * (point[0] - line_start[0])
+            ) / line_length
+            track = self.track_states.setdefault(
+                vehicle_id,
+                {
+                    "vehicle_type": record["type"],
+                    "stable_side": None,
+                    "stable_point": point,
+                    "stable_frame": frame_index,
+                    "pending_side": None,
+                    "pending_side_frames": 0,
+                    "pending_signal": "UNKNOWN",
+                    "last_seen_frame": frame_index,
+                    "alerted": False,
+                },
+            )
+            previous_side = track["stable_side"]
+            new_side = (
+                1 if signed_distance > deadband else
+                -1 if signed_distance < -deadband else
+                None
+            )
+            if new_side is None or new_side == previous_side:
+                track["pending_side"] = None
+                track["pending_side_frames"] = 0
+            elif track["pending_side"] == new_side:
+                track["pending_side_frames"] += 1
+            else:
+                track["pending_side"] = new_side
+                track["pending_side_frames"] = 1
+                track["pending_signal"] = self.signal_state
+
+            if (
+                new_side is not None
+                and new_side != previous_side
+                and track["pending_side_frames"]
+                >= config.RED_LIGHT_CROSSING_CONFIRMATION_FRAMES
+            ):
+                gap = frame_index - track["stable_frame"]
+                crossed_as_configured = (
+                    previous_side is not None
+                    and (
+                        previous_side < new_side
+                        if direction_sign > 0
+                        else previous_side > new_side
+                    )
+                )
+                movement = (
+                    point[0] - track["stable_point"][0],
+                    point[1] - track["stable_point"][1],
+                )
+                moved_through_line = (
+                    movement[0] * movement[0] + movement[1] * movement[1]
+                ) >= (deadband * 2) ** 2
+                if (
+                    crossed_as_configured
+                    and gap <= max_gap_frames
+                    and moved_through_line
+                    and track["pending_signal"] == "RED"
+                ):
+                    track["alerted"] = True
+                    self.events.append(
+                        {
+                            "vehicle_id": vehicle_id,
+                            "vehicle_type": record["type"],
+                            "frame": frame_index,
+                            "signal": track["pending_signal"],
+                        }
+                    )
+                track["stable_side"] = new_side
+                track["stable_point"] = point
+                track["stable_frame"] = frame_index
+                track["pending_side"] = None
+                track["pending_side_frames"] = 0
+            track["last_seen_frame"] = frame_index
+            track["vehicle_type"] = record["type"]
+            current_states[vehicle_id] = {
+                "vehicle_id": vehicle_id,
+                "state": "VIOLATION" if track["alerted"] else "CLEAR",
+                "side": track["stable_side"],
+            }
+
+        stale_frames = max_gap_frames * 2
+        for vehicle_id, track in list(self.track_states.items()):
+            if frame_index - track["last_seen_frame"] > stale_frames:
+                del self.track_states[vehicle_id]
+
+        return {
+            "signal_state": self.signal_state,
+            "raw_signal_state": raw_signal,
+            "vehicle_states": current_states,
+        }
 
 
 def resolve_lane_config(
@@ -297,7 +585,7 @@ class WrongDirectionDetector:
                         frame,
                         [np.asarray(trajectory, dtype=np.int32)],
                         False,
-                        color,
+                        (160, 160, 160),
                         2,
                     )
                 movement = track["movement"]
@@ -491,6 +779,7 @@ def _process_frame(
     recognized_plates: dict[str, dict[str, Any]],
     plate_boxes_by_vehicle: dict[str, tuple[int, int, int, int]],
     wrong_direction_detector: WrongDirectionDetector | None = None,
+    red_light_detector: RedLightViolationDetector | None = None,
     frame_index: int = 0,
 ) -> Any:
     raw_frame = frame.copy()
@@ -536,11 +825,29 @@ def _process_frame(
             }
         )
 
+    violation_labels: dict[str, list[str]] = {}
     if wrong_direction_detector is not None:
-        wrong_direction_detector.update(records, frame, frame_index)
+        direction_states = wrong_direction_detector.update(
+            records, frame, frame_index
+        )
+        for vehicle_id, state in direction_states.items():
+            if state["state"] == "WRONG_DIRECTION":
+                violation_labels.setdefault(vehicle_id, []).append(
+                    "WRONG DIRECTION"
+                )
+    if red_light_detector is not None:
+        red_light_states = red_light_detector.update(frame, records, frame_index)
+        for vehicle_id, state in red_light_states["vehicle_states"].items():
+            if state["state"] == "VIOLATION":
+                violation_labels.setdefault(vehicle_id, []).append(
+                    "RED-LIGHT VIOLATION"
+                )
 
     if "helmet" in operations:
-        _detect_helmets_for_two_wheelers(frame, raw_frame, records, models["helmet"])
+        for vehicle_id in _detect_helmets_for_two_wheelers(
+            frame, raw_frame, records, models["helmet"]
+        ):
+            violation_labels.setdefault(vehicle_id, []).append("NO HELMET")
 
     if "plate" in operations:
         _detect_plates_for_vehicles(
@@ -554,6 +861,16 @@ def _process_frame(
             recognized_plates,
             plate_boxes_by_vehicle,
         )
+
+    for record in records:
+        labels = violation_labels.get(record["id"])
+        if labels:
+            _draw_box(
+                frame,
+                record["box"],
+                f"{record['id']} {' · '.join(labels)}",
+                config.RED_LIGHT_VIOLATION_COLOR,
+            )
     return frame
 
 
@@ -562,10 +879,10 @@ def _detect_helmets_for_two_wheelers(
     raw_frame: Any,
     records: list[dict[str, Any]],
     helmet_model: YOLO,
-) -> None:
+) -> set[str]:
     two_wheelers = [r for r in records if r["type"] in config.HELMET_VEHICLES]
     if not two_wheelers:
-        return
+        return set()
 
     result = helmet_model.predict(
         source=raw_frame,
@@ -574,7 +891,7 @@ def _detect_helmets_for_two_wheelers(
         verbose=False,
     )[0]
     if result.boxes is None:
-        return
+        return set()
 
     height, width = raw_frame.shape[:2]
     rider_regions = []
@@ -592,6 +909,7 @@ def _detect_helmets_for_two_wheelers(
             )
         )
 
+    violating_vehicle_ids = set()
     for box in result.boxes:
         helmet_box = _clip_box(
             box.xyxy[0].cpu().tolist(), width, height
@@ -616,13 +934,32 @@ def _detect_helmets_for_two_wheelers(
             ** 2,
         )
         label = _model_name(helmet_model.names, int(box.cls[0].item()))
+        normalized_label = " ".join(
+            label.lower().replace("_", " ").replace("-", " ").split()
+        )
+        is_violation = any(
+            phrase in normalized_label
+            for phrase in (
+                "without helmet",
+                "no helmet",
+                "not wearing helmet",
+                "helmetless",
+            )
+        )
         confidence = float(box.conf[0].item())
         _draw_box(
             frame,
             helmet_box,
             f"{region[4]} {label} {confidence:.2f}",
-            config.HELMET_COLOR,
+            (
+                config.RED_LIGHT_VIOLATION_COLOR
+                if is_violation
+                else config.HELMET_COLOR
+            ),
         )
+        if is_violation:
+            violating_vehicle_ids.add(region[4])
+    return violating_vehicle_ids
 
 
 def _detect_plates_for_vehicles(
@@ -721,11 +1058,24 @@ def process_media(
     selected_operations: Iterable[str] = config.OPERATIONS,
     lane_direction: str = config.DEFAULT_LANE_DIRECTION,
     lane_polygon: Iterable[Iterable[float]] = config.DEFAULT_LANE_POLYGON,
+    light_roi: Iterable[float] | None = None,
+    stop_line: Iterable[Iterable[float]] | None = None,
+    crossing_direction: str = config.DEFAULT_RED_LIGHT_CROSSING_DIRECTION,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     operations = resolve_operations(selected_operations)
     lane_direction, lane_polygon = resolve_lane_config(
         lane_direction, lane_polygon
     )
+    red_light_config = None
+    if "red_light" in operations:
+        if light_roi is None or stop_line is None:
+            raise ValueError(
+                "Configure the traffic-light region and stop line before analysis."
+            )
+        red_light_config = resolve_red_light_config(
+            light_roi, stop_line, crossing_direction
+        )
     suffix = source_path.suffix.lower()
     is_video = suffix in config.VIDEO_EXTENSIONS
     is_image = suffix in config.IMAGE_EXTENSIONS
@@ -741,6 +1091,15 @@ def process_media(
     output_path = analysis_dir / f"processed{suffix if is_image else '.webm'}"
 
     with _PROCESSING_LOCK:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "loading_models",
+                    "progress": 0,
+                    "current_frame": 0,
+                    "total_frames": None,
+                }
+            )
         models = _load_models(operations)
         vehicle_model = models["vehicle"]
         vehicle_class_ids = _track_class_ids(vehicle_model)
@@ -757,6 +1116,7 @@ def process_media(
         recognized_plates: dict[str, dict[str, Any]] = {}
         plate_boxes_by_vehicle: dict[str, tuple[int, int, int, int]] = {}
         wrong_direction_detector = None
+        red_light_detector = None
 
         if is_image:
             if "wrong_direction" in operations:
@@ -766,9 +1126,23 @@ def process_media(
                     fps=1.0,
                     debug=config.DEBUG_WRONG_DIRECTION,
                 )
+            if red_light_config is not None:
+                red_light_detector = RedLightViolationDetector(
+                    *red_light_config,
+                    fps=1.0,
+                )
             frame = cv2.imread(str(stored_source))
             if frame is None:
                 raise ValueError(f"Could not read image: {source_path.name}")
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "processing",
+                        "progress": 0,
+                        "current_frame": 0,
+                        "total_frames": 1,
+                    }
+                )
             processed = _process_frame(
                 frame,
                 False,
@@ -779,6 +1153,8 @@ def process_media(
                 recognized_plates,
                 plate_boxes_by_vehicle,
                 wrong_direction_detector,
+                red_light_detector,
+                1,
             )
             if not cv2.imwrite(str(output_path), processed):
                 raise RuntimeError(f"Could not save processed image: {output_path}")
@@ -795,8 +1171,23 @@ def process_media(
                     fps=fps,
                     debug=config.DEBUG_WRONG_DIRECTION,
                 )
+            if red_light_config is not None:
+                red_light_detector = RedLightViolationDetector(
+                    *red_light_config,
+                    fps=fps,
+                )
             width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "processing",
+                        "progress": 0,
+                        "current_frame": 0,
+                        "total_frames": total_frames if total_frames > 0 else None,
+                    }
+                )
             if width <= 0 or height <= 0:
                 capture.release()
                 raise ValueError(f"Could not determine video dimensions: {source_path.name}")
@@ -825,17 +1216,54 @@ def process_media(
                         recognized_plates,
                         plate_boxes_by_vehicle,
                         wrong_direction_detector,
+                        red_light_detector,
                         frame_index,
                     )
                     writer.write(processed)
                     frames_written += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "phase": "processing",
+                                "progress": (
+                                    min(
+                                        99,
+                                        round(frames_written * 100 / total_frames),
+                                    )
+                                    if total_frames > 0
+                                    else 0
+                                ),
+                                "current_frame": frames_written,
+                                "total_frames": (
+                                    total_frames if total_frames > 0 else None
+                                ),
+                            }
+                        )
             finally:
                 capture.release()
                 writer.release()
             if frames_written == 0:
                 output_path.unlink(missing_ok=True)
                 raise RuntimeError("The input video contains no readable frames.")
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "finalizing",
+                        "progress": 99,
+                        "current_frame": frames_written,
+                        "total_frames": total_frames if total_frames > 0 else None,
+                    }
+                )
 
+    if progress_callback is not None and is_image:
+        progress_callback(
+            {
+                "phase": "finalizing",
+                "progress": 99,
+                "current_frame": 1,
+                "total_frames": 1,
+            }
+        )
     analysis_id = analysis_dir.name
     return {
         "analysis_id": analysis_id,
@@ -868,6 +1296,25 @@ def process_media(
             ]
             if wrong_direction_detector is not None
             else []
+        ),
+        "red_light_signal_state": (
+            red_light_detector.signal_state
+            if red_light_detector is not None
+            else None
+        ),
+        "red_light_events": (
+            red_light_detector.events
+            if red_light_detector is not None
+            else []
+        ),
+        "red_light_configuration": (
+            {
+                "light_roi": red_light_detector.light_roi,
+                "stop_line": red_light_detector.stop_line,
+                "crossing_direction": red_light_detector.crossing_direction,
+            }
+            if red_light_detector is not None
+            else None
         ),
     }
 

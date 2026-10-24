@@ -18,10 +18,10 @@ code_trials
 output/
 runs/
 tests/
-data/
 models/
 # Database files
 *.db
 
 # Per-analysis processed uploads and outputs
 analysis_results/
+.local_config/

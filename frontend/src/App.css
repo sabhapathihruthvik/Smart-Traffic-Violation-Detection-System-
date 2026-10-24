@@ -575,6 +575,222 @@
   color: #ffb5a8 !important;
 }
 
+.lane-config-save-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.lane-config-save-row button {
+  padding: 8px 10px;
+  border: 1px solid #3b4954;
+  border-radius: 4px;
+  color: #cbd4dc;
+  background: #10171d;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.lane-config-save-row button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.lane-config-save-row span {
+  color: #8997a3;
+  font-size: 10px;
+  text-align: right;
+}
+
+.red-light-settings {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #0e151a;
+}
+
+.red-light-settings-heading,
+.analysis-progress-heading,
+.analysis-progress-details,
+.red-light-save-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.red-light-settings-heading h4 {
+  margin: 0;
+  color: #dfe5eb;
+  font: 500 12px var(--heading);
+}
+
+.red-light-settings-heading p {
+  margin: 4px 0 0;
+  color: #8997a3;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.red-light-settings-heading > span {
+  flex: 0 0 auto;
+  color: #ffbd78;
+  font: 9px var(--mono);
+}
+
+.red-light-settings-heading > span.config-saved {
+  color: var(--accent);
+}
+
+.red-light-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.red-light-tools button {
+  padding: 8px 10px;
+  border: 1px solid #3b4954;
+  border-radius: 4px;
+  color: #cbd4dc;
+  background: #10171d;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.red-light-tools button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.red-light-tools button.secondary {
+  margin-left: auto;
+}
+
+.red-light-preview-stage {
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+  padding: 10px;
+  border: 1px solid #26333d;
+  border-radius: 4px;
+  background: #070a0d;
+}
+
+.red-light-preview-frame {
+  position: relative;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #070a0d;
+}
+
+.red-light-source-preview {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+}
+
+.red-light-drawing-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.traffic-light-roi,
+.draft-traffic-light-roi {
+  fill: #36d9ff22;
+  stroke: #36d9ff;
+  stroke-width: 0.8;
+  vector-effect: non-scaling-stroke;
+}
+
+.draft-traffic-light-roi {
+  fill: #36d9ff12;
+  stroke-dasharray: 4 3;
+}
+
+.configured-stop-line,
+.draft-stop-line {
+  stroke: #ffd74a;
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.draft-stop-line {
+  stroke-dasharray: 5 3;
+}
+
+.red-light-instructions {
+  margin: -4px 0 0;
+  color: #aab5bf;
+  font-size: 10px;
+}
+
+.red-light-save-row > span {
+  color: #8997a3;
+  font-size: 10px;
+  text-align: right;
+}
+
+.analysis-progress {
+  display: grid;
+  gap: 9px;
+  margin-top: 18px;
+  padding: 13px;
+  border: 1px solid #3b4954;
+  border-radius: 5px;
+  background: #10171d;
+}
+
+.analysis-progress-heading strong {
+  color: #e1e7ed;
+  font: 500 11px var(--heading);
+}
+
+.analysis-progress-heading span,
+.analysis-progress-details {
+  color: #a2aeb9;
+  font: 9px var(--mono);
+}
+
+.analysis-progress progress {
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 5px;
+  background: #27323b;
+  accent-color: var(--accent);
+}
+
+.analysis-progress progress::-webkit-progress-bar {
+  border-radius: 5px;
+  background: #27323b;
+}
+
+.analysis-progress progress::-webkit-progress-value {
+  border-radius: 5px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.analysis-progress progress::-moz-progress-bar {
+  border-radius: 5px;
+  background: var(--accent);
+}
+
 .operation-copy {
   min-width: 0;
   display: flex;
@@ -1028,6 +1244,36 @@
   color: #84919d;
 }
 
+.red-light-result-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px;
+  color: #aab5bf;
+  font-size: 10px;
+}
+
+.signal-state {
+  font: 10px var(--mono);
+}
+
+.signal-red {
+  color: #9ba7b1;
+}
+
+.signal-yellow {
+  color: #ffd74a;
+}
+
+.signal-green {
+  color: #74e293;
+}
+
+.signal-unknown {
+  color: #9ba7b1;
+}
+
 .page-footer {
   display: flex;
   justify-content: space-between;
@@ -1096,6 +1342,16 @@
 
   .lane-point-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .red-light-save-row,
+  .analysis-progress-details {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .red-light-save-row > span {
+    text-align: left;
   }
 
   .section-heading h2 {
