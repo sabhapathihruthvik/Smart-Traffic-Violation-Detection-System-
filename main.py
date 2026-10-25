@@ -19,6 +19,7 @@ from inference import (
     resolve_lane_config,
     resolve_operations,
     resolve_red_light_config,
+    validate_operation_media,
 )
 import inference_config as inference_settings
 from models import Vehicle, Violation, ViolationType
@@ -647,6 +648,11 @@ async def analyze_media(
                 status_code=415,
                 detail="Upload an image or video in a supported format.",
             )
+
+    try:
+        validate_operation_media(source_suffix, selected_operations)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
     selected_lane_direction = inference_settings.DEFAULT_LANE_DIRECTION
     selected_lane_polygon = inference_settings.DEFAULT_LANE_POLYGON

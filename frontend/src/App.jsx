@@ -33,7 +33,7 @@ const formatDirection = (direction) => direction.replace("_TO_", " → ");
 const OPERATIONS = [
   {
     id: "vehicle",
-    title: "Vehicle detection",
+    title: "Vehicle detection and tracking",
     description: "Find and track vehicles with unique IDs.",
     dependency: "Base operation",
   },
@@ -42,18 +42,6 @@ const OPERATIONS = [
     title: "Helmet detection",
     description: "Check helmet use inside bike/motorcycle boxes.",
     dependency: "Requires vehicle detection",
-  },
-  {
-    id: "plate",
-    title: "Number plate detection",
-    description: "Locate plates belonging to tracked vehicles.",
-    dependency: "Requires vehicle detection",
-  },
-  {
-    id: "ocr",
-    title: "OCR",
-    description: "Read text from detected number plates.",
-    dependency: "Requires plate + vehicle detection",
   },
   {
     id: "wrong_direction",
@@ -65,9 +53,26 @@ const OPERATIONS = [
     id: "red_light",
     title: "Red-light violation detection",
     description: "Detect tracked vehicles crossing a configured stop line on red.",
-    dependency: "Requires vehicle tracking · Video only",
+    dependency: "Requires vehicle detection",
   },
+  {
+    id: "plate",
+    title: "Number plate detection",
+    description: "Find a plate inside each selected vehicle box.",
+    dependency: "Runs on violating vehicles when violation checks are selected",
+  },
+  {
+    id: "ocr",
+    title: "OCR",
+    description: "Read text from a plate, or directly from the vehicle box.",
+    dependency: "Does not require number plate detection",
+  }
 ];
+const OPERATION_GROUPS = [
+  { title: "Vehicle and violation detection", operations: OPERATIONS.slice(0, 4) },
+  { title: "Number plate and text recognition", operations: OPERATIONS.slice(4) },
+];
+const VIOLATION_OPERATIONS = ["helmet", "wrong_direction", "red_light"];
 
 function App() {
   const [samples, setSamples] = useState([]);
@@ -119,6 +124,13 @@ function App() {
         `.${upload.name.split(".").pop()?.toLowerCase() || ""}`,
       )
     : selectedSampleInfo?.media_type === "video";
+  const hasViolationOperation = VIOLATION_OPERATIONS.some((operation) =>
+    selectedOperations.has(operation),
+  );
+  const plateOrOcrSelected =
+    selectedOperations.has("plate") || selectedOperations.has("ocr");
+  const plateOcrVideoRestriction =
+    isSelectedVideo && plateOrOcrSelected && !hasViolationOperation;
   const sourcePreviewUrl = upload
     ? uploadPreviewUrl
     : selectedSampleInfo
@@ -341,7 +353,6 @@ function App() {
         setLaneConfigSaved(false);
         setLaneConfigLoading(Boolean(redLightSourceKey));
       }
-      if (operation === "ocr") next.add("plate");
     } else {
       next.delete(operation);
       if (operation === "vehicle") {
@@ -357,7 +368,6 @@ function App() {
       if (operation === "wrong_direction") {
         setLaneConfigLoading(false);
       }
-      if (operation === "plate") next.delete("ocr");
     }
     setSelectedOperations(next);
     setResult(null);
@@ -486,6 +496,12 @@ function App() {
     event.preventDefault();
     if (!upload && !selectedSample) {
       setError("Choose a sample or upload an image/video to continue.");
+      return;
+    }
+    if (plateOcrVideoRestriction) {
+      setError(
+        "For videos, number-plate detection or OCR requires at least one violation operation. Without one, use an image.",
+      );
       return;
     }
     const body = new FormData();
@@ -632,9 +648,10 @@ function App() {
             single image or video.
           </p>
           <div className="feature-list">
-            <span><i>01</i> Helmet detection</span>
-            <span><i>02</i> Vehicle tracking</span>
-            <span><i>03</i> Plate OCR</span>
+            <span><i>01</i> Vehicle detection & tracking</span>
+            <span><i>02</i> Helmet detection</span>
+            <span><i>03</i> Wrong direction detection</span>
+            <span><i>04</i> Red light violation detection</span>
           </div>
         </div>
         <div className="hero-visual" aria-hidden="true">
@@ -697,39 +714,58 @@ function App() {
               </div>
               <span>{selectedOperations.size} SELECTED</span>
             </div>
-            <div className="operation-grid">
-              {OPERATIONS.map((operation) => {
-                const isVehicleRequired =
-                  operation.id === "vehicle" &&
-                  (selectedOperations.has("helmet") ||
-                    selectedOperations.has("plate") ||
-                    selectedOperations.has("wrong_direction") ||
-                    selectedOperations.has("red_light"));
-                const isPlateRequired =
-                  operation.id === "plate" && selectedOperations.has("ocr");
-                return (
-                  <label
-                    className={`operation-card ${selectedOperations.has(operation.id) ? "selected" : ""}`}
-                    key={operation.id}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedOperations.has(operation.id)}
-                      disabled={isVehicleRequired || isPlateRequired}
-                      onChange={(event) =>
-                        toggleOperation(operation.id, event.target.checked)
-                      }
-                    />
-                    <span className="operation-check" aria-hidden="true">✓</span>
-                    <span className="operation-copy">
-                      <strong>{operation.title}</strong>
-                      <small>{operation.description}</small>
-                      <em>{operation.dependency}</em>
-                    </span>
-                  </label>
-                );
-              })}
-            </div>
+            {OPERATION_GROUPS.map((group) => (
+              <div className="operation-group" key={group.title}>
+                <h4>{group.title}</h4>
+                <div className="operation-grid">
+                  {group.operations.map((operation) => {
+                    const isVehicleRequired =
+                      operation.id === "vehicle" &&
+                      (selectedOperations.has("helmet") ||
+                        selectedOperations.has("plate") ||
+                        selectedOperations.has("ocr") ||
+                        selectedOperations.has("wrong_direction") ||
+                        selectedOperations.has("red_light"));
+                    const plateOcrUnavailable =
+                      (operation.id === "plate" || operation.id === "ocr") &&
+                      isSelectedVideo &&
+                      !hasViolationOperation;
+                    return (
+                      <label
+                        className={`operation-card ${selectedOperations.has(operation.id) ? "selected" : ""} ${plateOcrUnavailable ? "unavailable" : ""}`}
+                        key={operation.id}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedOperations.has(operation.id)}
+                          disabled={
+                            isVehicleRequired ||
+                            (plateOcrUnavailable &&
+                              !selectedOperations.has(operation.id))
+                          }
+                          onChange={(event) =>
+                            toggleOperation(operation.id, event.target.checked)
+                          }
+                        />
+                        <span className="operation-check" aria-hidden="true">✓</span>
+                        <span className="operation-copy">
+                          <strong>{operation.title}</strong>
+                          <small>{operation.description}</small>
+                          <em>{operation.dependency}</em>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+            {isSelectedVideo && !hasViolationOperation && (
+              <p className="operation-note" role="status">
+                On videos, plate detection and OCR are available only when at
+                least one violation operation is selected. Select a violation
+                first, or choose an image to run plate/OCR by itself.
+              </p>
+            )}
             {selectedOperations.has("wrong_direction") && (
               <div className="lane-settings">
                 <label className="lane-direction-setting">
@@ -1112,7 +1148,11 @@ function App() {
             <button
               className="analyze-button"
               type="submit"
-              disabled={isProcessing || (!upload && !selectedSample)}
+              disabled={
+                isProcessing ||
+                (!upload && !selectedSample) ||
+                plateOcrVideoRestriction
+              }
             >
               {isProcessing ? (
                 <><span className="spinner" /> {uploading ? "Uploading…" : "Processing…"}</>

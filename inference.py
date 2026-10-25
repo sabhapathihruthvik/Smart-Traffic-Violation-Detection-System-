@@ -653,6 +653,19 @@ def resolve_operations(selected: Iterable[str]) -> tuple[str, ...]:
     return tuple(operation for operation in config.OPERATIONS if operation in chosen)
 
 
+def validate_operation_media(media_suffix: str, operations: Iterable[str]) -> None:
+    selected = set(operations)
+    if (
+        media_suffix.lower() in config.VIDEO_EXTENSIONS
+        and selected.intersection(("plate", "ocr"))
+        and not selected.intersection(config.VIOLATION_OPERATIONS)
+    ):
+        raise ValueError(
+            "Number-plate detection and OCR without a violation operation "
+            "are available for images only."
+        )
+
+
 @lru_cache(maxsize=3)
 def _load_yolo(operation: str) -> YOLO:
     try:
@@ -781,7 +794,11 @@ def _process_frame(
     wrong_direction_detector: WrongDirectionDetector | None = None,
     red_light_detector: RedLightViolationDetector | None = None,
     frame_index: int = 0,
+    plate_attempt_frames: dict[str, int] | None = None,
+    ocr_attempt_frames: dict[str, int] | None = None,
 ) -> Any:
+    plate_attempt_frames = plate_attempt_frames if plate_attempt_frames is not None else {}
+    ocr_attempt_frames = ocr_attempt_frames if ocr_attempt_frames is not None else {}
     raw_frame = frame.copy()
     vehicle_model = models["vehicle"]
     results = vehicle_model.track(
@@ -849,17 +866,25 @@ def _process_frame(
         ):
             violation_labels.setdefault(vehicle_id, []).append("NO HELMET")
 
-    if "plate" in operations:
+    if "plate" in operations or "ocr" in operations:
         _detect_plates_for_vehicles(
             frame,
             raw_frame,
-            records,
-            models["plate"],
+            models.get("plate"),
             models.get("ocr"),
             plate_class_ids,
+            "plate" in operations,
             "ocr" in operations,
             recognized_plates,
             plate_boxes_by_vehicle,
+            frame_index,
+            plate_attempt_frames,
+            ocr_attempt_frames,
+            (
+                [record for record in records if record["id"] in violation_labels]
+                if set(operations).intersection(config.VIOLATION_OPERATIONS)
+                else records
+            ),
         )
 
     for record in records:
@@ -965,22 +990,34 @@ def _detect_helmets_for_two_wheelers(
 def _detect_plates_for_vehicles(
     frame: Any,
     raw_frame: Any,
-    records: list[dict[str, Any]],
-    plate_model: YOLO,
+    plate_model: YOLO | None,
     ocr_engine: RapidOCR | None,
     plate_class_ids: list[int],
+    use_plate: bool,
     use_ocr: bool,
     recognized_plates: dict[str, dict[str, Any]],
     plate_boxes_by_vehicle: dict[str, tuple[int, int, int, int]],
+    frame_index: int,
+    plate_attempt_frames: dict[str, int],
+    ocr_attempt_frames: dict[str, int],
+    target_records: list[dict[str, Any]],
 ) -> None:
-    new_plate_records = [
+    if use_plate and plate_model is None:
+        raise ValueError("Number-plate detection was selected but its model is missing.")
+    if use_ocr and ocr_engine is None:
+        raise ValueError("OCR was selected but its engine is unavailable.")
+
+    interval = config.PLATE_OCR_INTERVAL_FRAMES
+    plate_due_records = [
         record
-        for record in records
-        if record["id"] not in plate_boxes_by_vehicle
+        for record in target_records
+        if frame_index - plate_attempt_frames.get(record["id"], -interval)
+        >= interval
     ]
     crops = []
     crop_records = []
-    for record in new_plate_records:
+    for record in (plate_due_records if use_plate else ()):
+        plate_attempt_frames[record["id"]] = frame_index
         x1, y1, x2, y2 = record["box"]
         crop = raw_frame[y1:y2, x1:x2]
         if crop.size:
@@ -988,57 +1025,79 @@ def _detect_plates_for_vehicles(
             crop_records.append(record)
 
     batch_size = config.INFERENCE_BATCH_SIZE
-    for start in range(0, len(crops), batch_size):
-        batched_results = plate_model.predict(
-            source=crops[start : start + batch_size],
-            classes=plate_class_ids,
-            conf=config.PLATE_CONFIDENCE,
-            imgsz=config.PLATE_IMAGE_SIZE,
-            verbose=False,
-        )
-        for record, result in zip(
-            crop_records[start : start + batch_size], batched_results
-        ):
-            if result.boxes is None or len(result.boxes) == 0:
-                continue
-            best_box = max(result.boxes, key=lambda box: float(box.conf[0].item()))
-            bx1, by1, bx2, by2 = _clip_box(
-                best_box.xyxy[0].cpu().tolist(),
-                record["box"][2] - record["box"][0],
-                record["box"][3] - record["box"][1],
+    if use_plate and plate_model is not None:
+        for start in range(0, len(crops), batch_size):
+            batched_results = plate_model.predict(
+                source=crops[start : start + batch_size],
+                classes=plate_class_ids,
+                conf=config.PLATE_CONFIDENCE,
+                imgsz=config.PLATE_IMAGE_SIZE,
+                verbose=False,
             )
-            plate_boxes_by_vehicle[record["id"]] = (bx1, by1, bx2, by2)
+            for record, result in zip(
+                crop_records[start : start + batch_size], batched_results
+            ):
+                if result.boxes is None or len(result.boxes) == 0:
+                    continue
+                best_box = max(
+                    result.boxes, key=lambda box: float(box.conf[0].item())
+                )
+                bx1, by1, bx2, by2 = _clip_box(
+                    best_box.xyxy[0].cpu().tolist(),
+                    record["box"][2] - record["box"][0],
+                    record["box"][3] - record["box"][1],
+                )
+                plate_boxes_by_vehicle[record["id"]] = (bx1, by1, bx2, by2)
 
-    for record in records:
+    for record in target_records:
         vehicle_id = record["id"]
-        relative_box = plate_boxes_by_vehicle.get(vehicle_id)
-        if relative_box is None:
-            continue
-        vx1, vy1, vx2, vy2 = record["box"]
-        px1, py1, px2, py2 = relative_box
-        absolute_box = _clip_box(
-            (vx1 + px1, vy1 + py1, vx1 + px2, vy1 + py2),
-            frame.shape[1],
-            frame.shape[0],
-        )
-        label = f"{vehicle_id} plate"
+        if use_plate:
+            relative_box = plate_boxes_by_vehicle.get(vehicle_id)
+            if relative_box is None:
+                continue
+            vx1, vy1, _, _ = record["box"]
+            px1, py1, px2, py2 = relative_box
+            target_box = _clip_box(
+                (vx1 + px1, vy1 + py1, vx1 + px2, vy1 + py2),
+                frame.shape[1],
+                frame.shape[0],
+            )
+        else:
+            target_box = record["box"]
 
-        if use_ocr and vehicle_id not in recognized_plates and ocr_engine is not None:
-            ax1, ay1, ax2, ay2 = absolute_box
-            plate_crop = raw_frame[ay1:ay2, ax1:ax2]
-            if plate_crop.size:
-                text, confidence = _extract_ocr_text(ocr_engine(plate_crop))
-                if text:
+        label = f"{vehicle_id} plate" if use_plate else vehicle_id
+        if (
+            use_ocr
+            and ocr_engine is not None
+            and frame_index - ocr_attempt_frames.get(vehicle_id, -interval)
+            >= interval
+        ):
+            x1, y1, x2, y2 = target_box
+            crop = raw_frame[y1:y2, x1:x2]
+            if crop.size:
+                ocr_attempt_frames[vehicle_id] = frame_index
+                text, confidence = _extract_ocr_text(ocr_engine(crop))
+                previous = recognized_plates.get(vehicle_id)
+                previous_confidence = (
+                    previous.get("confidence") if previous is not None else None
+                )
+                if text and (
+                    previous is None
+                    or confidence is not None
+                    and (
+                        previous_confidence is None
+                        or confidence > previous_confidence
+                    )
+                ):
                     recognized_plates[vehicle_id] = {
                         "vehicle_id": vehicle_id,
                         "text": text,
                         "confidence": confidence,
                     }
-                    label = f"{vehicle_id} {text}"
-
-        if vehicle_id in recognized_plates:
+        if use_ocr and vehicle_id in recognized_plates:
             label = f"{vehicle_id} {recognized_plates[vehicle_id]['text']}"
-        _draw_box(frame, absolute_box, label, config.PLATE_COLOR)
+
+        _draw_box(frame, target_box, label, config.PLATE_COLOR)
 
 
 def _iter_video_frames(capture: Any):
@@ -1081,6 +1140,7 @@ def process_media(
     is_image = suffix in config.IMAGE_EXTENSIONS
     if not is_video and not is_image:
         raise ValueError(f"Unsupported media type: {suffix or '(no extension)'}")
+    validate_operation_media(suffix, operations)
 
     analysis_dir.mkdir(parents=True, exist_ok=True)
     if source_path.resolve().parent == analysis_dir.resolve():
@@ -1115,6 +1175,8 @@ def process_media(
         _reset_trackers(vehicle_model)
         recognized_plates: dict[str, dict[str, Any]] = {}
         plate_boxes_by_vehicle: dict[str, tuple[int, int, int, int]] = {}
+        plate_attempt_frames: dict[str, int] = {}
+        ocr_attempt_frames: dict[str, int] = {}
         wrong_direction_detector = None
         red_light_detector = None
 
@@ -1155,6 +1217,8 @@ def process_media(
                 wrong_direction_detector,
                 red_light_detector,
                 1,
+                plate_attempt_frames,
+                ocr_attempt_frames,
             )
             if not cv2.imwrite(str(output_path), processed):
                 raise RuntimeError(f"Could not save processed image: {output_path}")
@@ -1218,6 +1282,8 @@ def process_media(
                         wrong_direction_detector,
                         red_light_detector,
                         frame_index,
+                        plate_attempt_frames,
+                        ocr_attempt_frames,
                     )
                     writer.write(processed)
                     frames_written += 1

@@ -23,13 +23,15 @@ HELMET_RIDER_REGION_SIDE_SCALE = 0.20
 PLATE_CONFIDENCE = 0.263
 PLATE_IMAGE_SIZE = 640
 OCR_MIN_CONFIDENCE = 0.0
+PLATE_OCR_INTERVAL_FRAMES = 5
 
 OPERATIONS = ("vehicle", "helmet", "plate", "ocr", "wrong_direction", "red_light")
+VIOLATION_OPERATIONS = ("helmet", "wrong_direction", "red_light")
 OPERATION_DEPENDENCIES = {
     "vehicle": (),
     "helmet": ("vehicle",),
     "plate": ("vehicle",),
-    "ocr": ("vehicle", "plate"),
+    "ocr": ("vehicle",),
     "wrong_direction": ("vehicle",),
     "red_light": ("vehicle",),
 }
