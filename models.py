@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Text,
     Index,
+    Integer,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -72,6 +73,9 @@ class ViolationType(Base):
         String(100), unique=True, nullable=False
     )
     description: Mapped[str | None] = mapped_column(Text)
+    fine_amount: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False
     )

@@ -1,10 +1,8 @@
 
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker
-
-from models import Base, ViolationType
 
 
 # SQLite database file in the project directory
@@ -38,41 +36,53 @@ DEFAULT_VIOLATION_TYPES = [
         "code": "NO_HELMET",
         "name": "Riding Without Helmet",
         "description": "Riding a two-wheeler without a helmet.",
+        "fine_amount": 500,
     },
     {
         "code": "RED_LIGHT",
         "name": "Red-Light Violation",
         "description": "Crossing the stop line while the signal is red.",
+        "fine_amount": 1000,
     },
     {
         "code": "WRONG_LANE",
         "name": "Wrong-Lane Driving",
         "description": "Driving in a prohibited lane or direction.",
-    },
-    {
-        "code": "OVERLOADING",
-        "name": "Excess Passengers on Two-Wheeler",
-        "description": "Carrying more passengers than permitted.",
-    },
+        "fine_amount": 2000,
+    }
 ]
 
 
-def init_db():
-    """Create tables and seed default violation categories."""
-    Base.metadata.create_all(bind=engine)
+def init_db(target_engine: Engine = engine) -> None:
+    """Add and populate fine amounts once, without changing other records."""
+    with target_engine.begin() as connection:
+        if "violation_types" not in inspect(connection).get_table_names():
+            return
 
-    with SessionLocal() as session:
-        for item in DEFAULT_VIOLATION_TYPES:
-            existing = session.scalar(
-                select(ViolationType).where(
-                    ViolationType.code == item["code"]
-                )
+        columns = {
+            column["name"]
+            for column in inspect(connection).get_columns("violation_types")
+        }
+        if "fine_amount" in columns:
+            return
+
+        connection.execute(
+            text(
+                "ALTER TABLE violation_types "
+                "ADD COLUMN fine_amount INTEGER NOT NULL DEFAULT 0"
             )
-
-            if existing is None:
-                session.add(ViolationType(**item))
-
-        session.commit()
+        )
+        for item in DEFAULT_VIOLATION_TYPES:
+            connection.execute(
+                text(
+                    "UPDATE violation_types SET fine_amount = :fine_amount "
+                    "WHERE code = :code"
+                ),
+                {
+                    "fine_amount": item["fine_amount"],
+                    "code": item["code"],
+                },
+            )
 
 
 def get_db():

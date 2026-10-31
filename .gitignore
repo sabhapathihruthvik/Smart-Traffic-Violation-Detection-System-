@@ -19,7 +19,7 @@ output/
 runs/
 tests/
 models/yolo26m_face_lp.pt
-
+challans/
 # Database files
 *.db
 

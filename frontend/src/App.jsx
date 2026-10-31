@@ -74,6 +74,260 @@ const OPERATION_GROUPS = [
 ];
 const VIOLATION_OPERATIONS = ["helmet", "wrong_direction", "red_light"];
 
+function ChallanCandidate({ analysisId, candidate, violationTypes }) {
+  const [vehicleNumber, setVehicleNumber] = useState(candidate.text || "");
+  const [violationCode, setViolationCode] = useState(
+    candidate.violation_codes?.[0] || "",
+  );
+  const [customFineAmount, setCustomFineAmount] = useState(null);
+  const [vehicleLookup, setVehicleLookup] = useState({
+    loading: false,
+    vehicle: null,
+    error: "",
+  });
+  const [challan, setChallan] = useState(null);
+  const [challanError, setChallanError] = useState("");
+
+  const selectedViolation = violationTypes.find(
+    (type) => type.code === violationCode,
+  );
+  const fineAmount = customFineAmount ?? selectedViolation?.fine_amount ?? "";
+  const lookupMatchesInput =
+    vehicleLookup.vehicle?.vehicle_number?.trim().toUpperCase() ===
+    vehicleNumber.trim().toUpperCase();
+
+  useEffect(() => {
+    if (!vehicleNumber.trim()) return undefined;
+
+    let active = true;
+    const timer = window.setTimeout(async () => {
+      setVehicleLookup({ loading: true, vehicle: null, error: "" });
+      try {
+        const query = new URLSearchParams({
+          vehicle_number: vehicleNumber.trim(),
+        });
+        const response = await fetch(
+          `${API_BASE}/api/vehicles/lookup?${query}`,
+        );
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || "Could not look up vehicle.");
+        }
+        if (active) {
+          setVehicleLookup({
+            loading: false,
+            vehicle: payload.found ? payload : null,
+            error: payload.found ? "" : "No registered vehicle found.",
+          });
+        }
+      } catch (requestError) {
+        if (active) {
+          setVehicleLookup({
+            loading: false,
+            vehicle: null,
+            error: requestError.message,
+          });
+        }
+      }
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [vehicleNumber]);
+
+  async function issueChallan() {
+    setChallanError("");
+    setChallan(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/challans`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          analysis_id: analysisId,
+          vehicle_id: candidate.vehicle_id,
+          vehicle_number: vehicleNumber.trim(),
+          violation_code: violationCode,
+          fine_amount: Number(fineAmount),
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.detail || "Could not generate challan.");
+      }
+      setChallan(payload);
+    } catch (requestError) {
+      setChallanError(requestError.message);
+    }
+  }
+
+  return (
+    <article className="challan-candidate">
+      {candidate.evidence_url && (
+        <img
+          className="challan-evidence"
+          src={new URL(candidate.evidence_url, API_BASE).toString()}
+          alt={`Violation evidence frame for vehicle ${candidate.vehicle_id}`}
+        />
+      )}
+      <div className="challan-fields">
+        <div className="challan-candidate-heading">
+          <strong>{candidate.vehicle_id} · {candidate.vehicle_type || "Vehicle"}</strong>
+          <span>{candidate.violation_codes.join(", ")}</span>
+        </div>
+        <label>
+          OCR vehicle number · edit if needed
+          <input
+            value={vehicleNumber}
+            maxLength={20}
+            onChange={(event) => {
+              const nextNumber = event.target.value.toUpperCase();
+              setVehicleNumber(nextNumber);
+              setVehicleLookup({
+                loading: Boolean(nextNumber.trim()),
+                vehicle: null,
+                error: nextNumber.trim() ? "" : "Enter a vehicle number.",
+              });
+              setChallan(null);
+            }}
+          />
+        </label>
+        <div className="challan-owner" aria-live="polite">
+          {vehicleLookup.loading ? (
+            <span>Looking up registered owner…</span>
+          ) : vehicleLookup.vehicle ? (
+            <>
+              <strong>{vehicleLookup.vehicle.vehicle_owner || "Owner not provided"}</strong>
+              <small>
+                {vehicleLookup.vehicle.vehicle_type} ·{" "}
+                {vehicleLookup.vehicle.registered_mobile_number || "No mobile registered"}
+              </small>
+            </>
+          ) : (
+            <span className="challan-error">{vehicleLookup.error || "Enter a vehicle number."}</span>
+          )}
+        </div>
+        <label>
+          Challan type
+          <select
+            value={violationCode}
+            onChange={(event) => {
+              setViolationCode(event.target.value);
+              setCustomFineAmount(null);
+              setChallan(null);
+            }}
+          >
+            {violationTypes.map((type) => (
+              <option key={type.code} value={type.code}>{type.name}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Fine amount
+          <input
+            type="number"
+            min="0"
+            max="1000000"
+            step="1"
+            value={fineAmount}
+            onChange={(event) => {
+              setCustomFineAmount(event.target.value);
+              setChallan(null);
+            }}
+          />
+        </label>
+        {challanError && <p className="challan-error" role="alert">{challanError}</p>}
+        {challan ? (
+          <p className="challan-sent" role="status">
+            {challan.message}{" "}
+            <a href={`${API_BASE}${challan.file_url}`} target="_blank" rel="noreferrer">
+              View challan
+            </a>
+          </p>
+        ) : (
+          <button
+            className="challan-issue-button"
+            type="button"
+            disabled={
+              !vehicleLookup.vehicle ||
+              !lookupMatchesInput ||
+              !violationCode ||
+              fineAmount === "" ||
+              !violationTypes.length
+            }
+            onClick={issueChallan}
+          >
+            Issue challan
+          </button>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function ChallanReview({ result }) {
+  const [violationTypes, setViolationTypes] = useState([]);
+  const [loadError, setLoadError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    fetch(`${API_BASE}/api/violation-types`)
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || "Could not load challan types.");
+        }
+        return payload;
+      })
+      .then((types) => {
+        if (active) setViolationTypes(types);
+      })
+      .catch((requestError) => {
+        if (active) setLoadError(requestError.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const candidates = result.ocr_results.filter(
+    (entry) => entry.violation_codes?.length && entry.evidence_url,
+  );
+  return (
+    <section className="challan-review" aria-labelledby="challan-heading">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">USER-CONTROLLED REVIEW</p>
+          <h2 id="challan-heading">Review and issue challan</h2>
+        </div>
+        <span className="analysis-id">NO DATABASE RECORDING</span>
+      </div>
+      <p className="challan-instructions">
+        Confirm the vehicle and owner details, then adjust the challan type or
+        fine amount before issuing.
+      </p>
+      {loadError && <p className="challan-error" role="alert">{loadError}</p>}
+      {candidates.length ? (
+        <div className="challan-candidate-list">
+          {candidates.map((candidate) => (
+            <ChallanCandidate
+              key={`${result.analysis_id}-${candidate.vehicle_id}`}
+              analysisId={result.analysis_id}
+              candidate={candidate}
+              violationTypes={violationTypes}
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="challan-empty">
+          No OCR-recognized vehicle with a confirmed violation and saved evidence
+          is ready for challan review.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function App() {
   const [samples, setSamples] = useState([]);
   const [analyses, setAnalyses] = useState([]);
@@ -1342,6 +1596,9 @@ function App() {
             )}
           </div>
         </section>
+      )}
+      {result && result.operations.includes("ocr") && (
+        <ChallanReview result={result} />
       )}
 
       <footer className="page-footer">

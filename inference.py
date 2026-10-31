@@ -34,6 +34,11 @@ _RED_LIGHT_CROSSING_DIRECTIONS = {
     "NEGATIVE_TO_POSITIVE",
     "POSITIVE_TO_NEGATIVE",
 }
+_VIOLATION_CODES = {
+    "NO HELMET": "NO_HELMET",
+    "WRONG DIRECTION": "WRONG_LANE",
+    "RED-LIGHT VIOLATION": "RED_LIGHT",
+}
 
 
 def resolve_red_light_config(
@@ -796,6 +801,8 @@ def _process_frame(
     frame_index: int = 0,
     plate_attempt_frames: dict[str, int] | None = None,
     ocr_attempt_frames: dict[str, int] | None = None,
+    violation_details: dict[str, dict[str, Any]] | None = None,
+    evidence_dir: Path | None = None,
 ) -> Any:
     plate_attempt_frames = plate_attempt_frames if plate_attempt_frames is not None else {}
     ocr_attempt_frames = ocr_attempt_frames if ocr_attempt_frames is not None else {}
@@ -890,6 +897,31 @@ def _process_frame(
     for record in records:
         labels = violation_labels.get(record["id"])
         if labels:
+            if violation_details is not None:
+                details = violation_details.setdefault(
+                    record["id"],
+                    {
+                        "vehicle_id": record["id"],
+                        "vehicle_type": record["type"],
+                        "violation_codes": [],
+                        "evidence_url": None,
+                    },
+                )
+                for label in labels:
+                    code = _VIOLATION_CODES[label]
+                    if code not in details["violation_codes"]:
+                        details["violation_codes"].append(code)
+                if evidence_dir is not None and details["evidence_url"] is None:
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    evidence_path = evidence_dir / f"{record['id']}.jpg"
+                    if not cv2.imwrite(str(evidence_path), raw_frame):
+                        raise RuntimeError(
+                            f"Could not save violation evidence: {evidence_path}"
+                        )
+                    details["evidence_url"] = (
+                        f"/results/{evidence_dir.parent.name}/evidence/"
+                        f"{evidence_path.name}"
+                    )
             _draw_box(
                 frame,
                 record["box"],
@@ -1174,6 +1206,8 @@ def process_media(
 
         _reset_trackers(vehicle_model)
         recognized_plates: dict[str, dict[str, Any]] = {}
+        violation_details: dict[str, dict[str, Any]] = {}
+        evidence_dir = analysis_dir / "evidence"
         plate_boxes_by_vehicle: dict[str, tuple[int, int, int, int]] = {}
         plate_attempt_frames: dict[str, int] = {}
         ocr_attempt_frames: dict[str, int] = {}
@@ -1219,6 +1253,8 @@ def process_media(
                 1,
                 plate_attempt_frames,
                 ocr_attempt_frames,
+                violation_details,
+                evidence_dir,
             )
             if not cv2.imwrite(str(output_path), processed):
                 raise RuntimeError(f"Could not save processed image: {output_path}")
@@ -1284,6 +1320,8 @@ def process_media(
                         frame_index,
                         plate_attempt_frames,
                         ocr_attempt_frames,
+                        violation_details,
+                        evidence_dir,
                     )
                     writer.write(processed)
                     frames_written += 1
@@ -1331,12 +1369,27 @@ def process_media(
             }
         )
     analysis_id = analysis_dir.name
+    ocr_results = [
+        {
+            **plate,
+            **violation_details.get(
+                plate["vehicle_id"],
+                {
+                    "vehicle_type": None,
+                    "violation_codes": [],
+                    "evidence_url": None,
+                },
+            ),
+        }
+        for plate in recognized_plates.values()
+    ]
     return {
         "analysis_id": analysis_id,
         "media_type": "video" if is_video else "image",
         "result_url": f"/results/{analysis_id}/{output_path.name}",
         "operations": list(operations),
-        "ocr_results": list(recognized_plates.values()),
+        "ocr_results": ocr_results,
+        "violation_details": list(violation_details.values()),
         "lane_direction": (
             lane_direction if wrong_direction_detector is not None else None
         ),

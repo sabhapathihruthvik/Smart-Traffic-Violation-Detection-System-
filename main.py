@@ -1,17 +1,20 @@
 
+from contextlib import asynccontextmanager
+import html
 import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from database import SessionLocal
+from database import SessionLocal, init_db
 from inference import (
     convert_video_for_browser,
     new_analysis_id,
@@ -24,12 +27,23 @@ from inference import (
 import inference_config as inference_settings
 from models import Vehicle, Violation, ViolationType
 
-app = FastAPI(title="Smart Traffic Violation Detection API")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="Smart Traffic Violation Detection API",
+    lifespan=lifespan,
+)
 _VIDEO_CONVERSION_LOCK = Lock()
 _ANALYSIS_JOBS_LOCK = Lock()
 _SAMPLE_METADATA_LOCK = Lock()
 _ANALYSIS_JOBS: dict[str, dict] = {}
 _SAMPLE_METADATA_PATH = inference_settings.SAMPLE_DIR / "metadata.jsonl"
+_CHALLAN_DIR = Path(__file__).resolve().parent / "challans"
 
 
 class WrongDirectionConfiguration(BaseModel):
@@ -43,6 +57,14 @@ class RedLightConfiguration(BaseModel):
     light_roi: list[float]
     stop_line: list[list[float]]
     crossing_direction: str
+
+
+class ChallanRequest(BaseModel):
+    analysis_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    vehicle_id: str = Field(pattern=r"^V\d+$")
+    vehicle_number: str = Field(min_length=1, max_length=20)
+    violation_code: str = Field(min_length=1, max_length=40)
+    fine_amount: int = Field(ge=0, le=1_000_000)
 
 
 def _read_sample_metadata() -> list[dict]:
@@ -800,6 +822,26 @@ def get_vehicles():
         ]
 
 
+@app.get("/api/vehicles/lookup")
+def lookup_vehicle(vehicle_number: str):
+    normalized_number = vehicle_number.strip().upper()
+    if not normalized_number or len(normalized_number) > 20:
+        raise HTTPException(status_code=400, detail="Invalid vehicle number.")
+    with SessionLocal() as db:
+        vehicle = db.connection().exec_driver_sql(
+            "SELECT id, vehicle_number, vehicle_type, vehicle_owner, "
+            "registered_mobile_number FROM vehicles "
+            "WHERE vehicle_number = ? COLLATE NOCASE LIMIT 1",
+            (normalized_number,),
+        ).mappings().one_or_none()
+        if vehicle is None:
+            return {"found": False, "vehicle_number": normalized_number}
+        return {
+            "found": True,
+            **dict(vehicle),
+        }
+
+
 @app.get("/api/violations")
 def get_violations():
     with SessionLocal() as db:
@@ -827,6 +869,203 @@ def get_violation_types():
             ViolationType.is_active.is_(True)
         ).all()
         return [
-            {"id": t.id, "code": t.code, "name": t.name}
+            {
+                "id": t.id,
+                "code": t.code,
+                "name": t.name,
+                "fine_amount": t.fine_amount,
+            }
             for t in types
         ]
+
+
+@app.post("/api/challans")
+def create_challan(request: ChallanRequest):
+    normalized_number = request.vehicle_number.strip().upper()
+    if not normalized_number:
+        raise HTTPException(status_code=400, detail="Vehicle number is required.")
+    with SessionLocal() as db:
+        connection = db.connection()
+        vehicle = connection.exec_driver_sql(
+            "SELECT vehicle_number, vehicle_type, vehicle_owner, "
+            "registered_mobile_number FROM vehicles "
+            "WHERE vehicle_number = ? COLLATE NOCASE LIMIT 1",
+            (normalized_number,),
+        ).mappings().one_or_none()
+        if vehicle is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No registered vehicle matches this number.",
+            )
+        violation_type = connection.exec_driver_sql(
+            "SELECT name FROM violation_types "
+            "WHERE code = ? AND is_active = 1 LIMIT 1",
+            (request.violation_code,),
+        ).mappings().one_or_none()
+        if violation_type is None:
+            raise HTTPException(status_code=404, detail="Violation type not found.")
+        vehicle_info = {
+            "vehicle_number": vehicle["vehicle_number"],
+            "vehicle_type": vehicle["vehicle_type"],
+            "vehicle_owner": vehicle["vehicle_owner"] or "Not available",
+            "registered_mobile_number": (
+                vehicle["registered_mobile_number"] or "Not available"
+            ),
+        }
+        violation_name = violation_type["name"]
+
+    analysis_dir = (
+        inference_settings.ANALYSIS_DIR / request.analysis_id
+    ).resolve()
+    if (
+        analysis_dir.parent != inference_settings.ANALYSIS_DIR.resolve()
+        or not analysis_dir.is_dir()
+    ):
+        raise HTTPException(status_code=404, detail="Analysis result not found.")
+    metadata_path = analysis_dir / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise HTTPException(
+            status_code=404, detail="Analysis metadata not found."
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=500, detail="Could not read analysis metadata."
+        ) from error
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=500, detail="Analysis metadata is invalid.")
+
+    ocr_results = metadata.get("ocr_results", [])
+    if not isinstance(ocr_results, list):
+        raise HTTPException(
+            status_code=500, detail="Analysis OCR metadata is invalid."
+        )
+    ocr_entry = next(
+        (
+            entry
+            for entry in ocr_results
+            if isinstance(entry, dict)
+            and entry.get("vehicle_id") == request.vehicle_id
+            and entry.get("violation_codes")
+        ),
+        None,
+    )
+    if ocr_entry is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This analysis has no OCR-confirmed violation for that vehicle.",
+        )
+    evidence_path = analysis_dir / "evidence" / f"{request.vehicle_id}.jpg"
+    if not evidence_path.is_file():
+        raise HTTPException(
+            status_code=404, detail="Violation evidence image not found."
+        )
+
+    challan_id = uuid4().hex
+    evidence_url = (
+        f"/results/{request.analysis_id}/evidence/{request.vehicle_id}.jpg"
+    )
+    issued_at = datetime.now(timezone.utc)
+    fields = {
+        "challan_id": challan_id,
+        "created_at": issued_at.strftime("%d %B %Y · %I:%M %p UTC"),
+        "issued_at": issued_at.isoformat(),
+        **vehicle_info,
+        "violation_type": violation_name,
+        "fine_amount": request.fine_amount,
+    }
+    document = f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traffic challan · {html.escape(challan_id)}</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;padding:40px 18px;background:#edf2f5;color:#182538;font:15px/1.5 "Segoe UI",Arial,sans-serif}}
+.sheet{{max-width:850px;margin:0 auto;background:#fff;border:1px solid #d9e1e8;border-radius:20px;overflow:hidden;box-shadow:0 24px 70px #192b3b20}}
+.masthead{{position:relative;overflow:hidden;padding:32px 38px;color:#fff;background:linear-gradient(120deg,#102235,#183b54 68%,#14665e)}}
+.masthead:after{{position:absolute;right:-46px;top:-112px;width:300px;height:300px;border:1px solid #ffffff24;border-radius:50%;content:""}}
+.masthead:before{{position:absolute;right:50px;top:-74px;width:220px;height:220px;border:1px solid #ffffff20;border-radius:50%;content:""}}
+.brand-row,.title-row,.document-meta,.info-grid,.detail-grid{{display:flex;justify-content:space-between;gap:20px}}
+.brand{{display:flex;align-items:center;gap:12px;font-size:14px;font-weight:700;letter-spacing:.13em;text-transform:uppercase}}
+.brand-mark{{display:grid;width:38px;height:38px;place-items:center;border:1px solid #ffffff55;border-radius:12px;color:#a8f0d7;font-weight:800}}
+.status{{position:relative;z-index:1;align-self:center;padding:7px 12px;border:1px solid #a8f0d788;border-radius:999px;color:#c5f6df;font-size:10px;font-weight:700;letter-spacing:.14em}}
+.title-row{{align-items:flex-end;margin-top:40px}}
+.eyebrow,.label{{margin:0;color:#7a8a99;font-size:10px;font-weight:700;letter-spacing:.16em;text-transform:uppercase}}
+.masthead .eyebrow{{color:#a7c7d2}}
+h1{{margin:5px 0 0;font-size:32px;line-height:1.1;letter-spacing:-.04em}}
+.fine-box{{position:relative;z-index:1;min-width:190px;padding:14px 18px;border:1px solid #ffffff38;border-radius:14px;background:#ffffff12;text-align:right}}
+.fine-box span{{display:block;color:#b8d2dc;font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}}
+.fine-box strong{{display:block;margin-top:2px;color:#c5f6df;font-size:27px;line-height:1.2}}
+.content{{padding:30px 38px 34px}}
+.document-meta{{align-items:center;padding-bottom:22px;border-bottom:1px solid #e8edf1}}
+.document-meta strong{{display:block;margin-top:4px;font:600 12px "Consolas",monospace;letter-spacing:.04em}}
+.section-title{{display:flex;align-items:center;gap:10px;margin:26px 0 13px;color:#26394c;font-size:13px;font-weight:700}}
+.section-title:before{{width:4px;height:18px;border-radius:3px;background:#14a77a;content:""}}
+.info-grid{{gap:12px}}
+.info-card{{flex:1;min-width:0;padding:15px 16px;border:1px solid #e5ebef;border-radius:13px;background:#f8fafb}}
+.info-card span,.detail-item span{{display:block;color:#748493;font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}}
+.info-card strong{{display:block;margin-top:7px;overflow-wrap:anywhere;color:#192b3d;font-size:14px}}
+.vehicle-number{{font:700 19px "Consolas",monospace!important;letter-spacing:.06em}}
+.violation-card{{display:grid;grid-template-columns:1fr auto;align-items:center;gap:18px;padding:18px 20px;border:1px solid #dcebe5;border-radius:14px;background:linear-gradient(105deg,#f2faf6,#f5f8fa)}}
+.violation-card strong{{display:block;margin-top:6px;color:#183849;font-size:17px}}
+.fine-inline{{color:#12684f;font-size:20px;font-weight:800;white-space:nowrap}}
+.evidence-frame{{margin:0;overflow:hidden;border:1px solid #e2e8ed;border-radius:14px;background:#f5f7f9}}
+.evidence-frame img{{display:block;width:100%;max-height:400px;object-fit:contain;background:#101820}}
+.evidence-frame figcaption{{padding:10px 14px;color:#71808d;font-size:10px}}
+.footer{{display:flex;justify-content:space-between;gap:16px;margin-top:28px;padding-top:16px;border-top:1px solid #e8edf1;color:#83909b;font-size:10px}}
+.footer strong{{color:#426071}}
+@media(max-width:620px){{body{{padding:12px}}.sheet{{border-radius:14px}}.masthead,.content{{padding:24px 20px}}.title-row{{align-items:flex-start;flex-direction:column;margin-top:32px}}.fine-box{{width:100%;text-align:left}}.info-grid{{flex-direction:column}}.document-meta{{align-items:flex-start;flex-direction:column}}.footer{{flex-direction:column}}}}
+@media print{{@page{{size:A4;margin:12mm}}body{{padding:0;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}}.sheet{{max-width:none;border:0;border-radius:0;box-shadow:none}}.masthead{{border-radius:0}}.content{{padding:24px 30px}}.evidence-frame img{{max-height:310px}}}}
+</style></head>
+<body><main class="sheet">
+<header class="masthead">
+<div class="brand-row"><div class="brand"><span class="brand-mark">TV</span><span>Traffic Vision</span></div><span class="status">● &nbsp; ISSUED</span></div>
+<div class="title-row"><div><p class="eyebrow">TRAFFIC ENFORCEMENT</p><h1>Violation challan</h1></div>
+<div class="fine-box"><span>Payable fine</span><strong>₹{fields["fine_amount"]:,}</strong></div></div>
+</header>
+<div class="content">
+<div class="document-meta"><div><span class="label">Challan reference</span><strong>{html.escape(fields["challan_id"].upper())}</strong></div>
+<div><span class="label">Date issued</span><strong>{html.escape(fields["created_at"])}</strong></div></div>
+<h2 class="section-title">Registered vehicle & owner</h2>
+<div class="info-grid">
+<div class="info-card"><span>Vehicle number</span><strong class="vehicle-number">{html.escape(fields["vehicle_number"])}</strong></div>
+<div class="info-card"><span>Vehicle class</span><strong>{html.escape(fields["vehicle_type"])}</strong></div>
+<div class="info-card"><span>Registered owner</span><strong>{html.escape(fields["vehicle_owner"])}</strong></div>
+<div class="info-card"><span>Contact number</span><strong>{html.escape(fields["registered_mobile_number"])}</strong></div>
+</div>
+<h2 class="section-title">Violation details</h2>
+<div class="violation-card"><div><span class="label">Offence recorded</span><strong>{html.escape(fields["violation_type"])}</strong></div><span class="fine-inline">₹{fields["fine_amount"]:,}</span></div>
+<h2 class="section-title">Violation evidence</h2>
+<figure class="evidence-frame"><img src="{html.escape(evidence_url, quote=True)}" alt="Captured frame of the traffic violation"><figcaption>Captured frame associated with this vehicle and offence.</figcaption></figure>
+<footer class="footer"><span><strong>Traffic Vision</strong> · Smart Traffic Analysis</span><span>Issued {html.escape(fields["created_at"])}</span></footer>
+</div></main></body></html>"""
+
+    try:
+        _CHALLAN_DIR.mkdir(parents=True, exist_ok=True)
+        document_path = _CHALLAN_DIR / f"{challan_id}.html"
+        temporary_path = document_path.with_suffix(".html.tmp")
+        temporary_path.write_text(document, encoding="utf-8")
+        temporary_path.replace(document_path)
+    except OSError as error:
+        raise HTTPException(
+            status_code=500, detail="Could not save the challan."
+        ) from error
+
+    return {
+        "challan_id": challan_id,
+        "status": "sent",
+        "message": "Challan sent successfully.",
+        "file_url": f"/api/challans/{challan_id}/document",
+        "evidence_url": evidence_url,
+    }
+
+
+@app.get("/api/challans/{challan_id}/document")
+def get_challan_document(challan_id: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", challan_id):
+        raise HTTPException(status_code=404, detail="Challan not found.")
+    document_path = _CHALLAN_DIR / f"{challan_id}.html"
+    if not document_path.is_file():
+        raise HTTPException(status_code=404, detail="Challan not found.")
+    return FileResponse(document_path, media_type="text/html")

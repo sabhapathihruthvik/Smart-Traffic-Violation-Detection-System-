@@ -37,6 +37,15 @@ overlays the detected signal state and marks confirmed red-light crossings.
 During analysis, the UI displays the current processing phase, frame-based
 progress, and an estimated remaining time when the video reports a frame count.
 
+When OCR identifies a vehicle during a confirmed violation, the original
+violation frame is saved with the analysis. The results UI lets an operator
+review that frame, correct the plate, verify the registered owner, and edit
+the challan type and fine before issuing a challan. The generated HTML
+document is saved under `challans/` and displayed as sent. Challans and
+violations are not written to SQLite. On startup, the app adds and fills
+`violation_types.fine_amount` only when that column is missing; other database
+records are not seeded or modified.
+
 Place the trained weights in the root `models/` folder using these filenames:
 
 - `yolo26m.pt` — vehicle detection and ByteTrack
